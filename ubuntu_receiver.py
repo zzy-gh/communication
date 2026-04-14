@@ -1,122 +1,90 @@
 #!/usr/bin/env python3
 import argparse
 import json
-from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
+import platform
+import shutil
+import subprocess
+import sys
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run a small HTTP server on Ubuntu to receive text snippets."
+        description="Send text or clipboard content to another machine."
     )
-    parser.add_argument("--host", default="0.0.0.0", help="Bind host, default: 0.0.0.0")
-    parser.add_argument("--port", type=int, default=8765, help="Bind port, default: 8765")
+    parser.add_argument("--host", required=True, help="Target IP or hostname")
+    parser.add_argument("--port", type=int, default=8765, help="Receiver port")
+    parser.add_argument("--token", default="", help="Optional shared token")
     parser.add_argument(
-        "--output",
-        default="received_messages.txt",
-        help="File used to store received text, default: received_messages.txt",
+        "--sender",
+        default=platform.node() or "unknown-sender",
+        help="Sender name shown on the receiver side",
     )
-    parser.add_argument(
-        "--token",
-        default="",
-        help="Optional shared token. If set, sender must provide the same token.",
-    )
+    parser.add_argument("--clipboard", action="store_true", help="Send clipboard content")
+    parser.add_argument("text", nargs="*", help="Text to send")
     return parser.parse_args()
 
 
-def build_handler(output_file: Path, token: str):
-    class ReceiverHandler(BaseHTTPRequestHandler):
-        def _send_json(self, status: int, payload: dict):
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+def read_clipboard():
+    clipboard_commands = [
+        ["pbpaste"],
+        ["wl-paste", "-n"],
+        ["xclip", "-selection", "clipboard", "-o"],
+        ["xsel", "--clipboard", "--output"],
+    ]
 
-        def do_GET(self):
-            if self.path != "/":
-                self._send_json(404, {"ok": False, "error": "Not found"})
-                return
-            self._send_json(
-                200,
-                {
-                    "ok": True,
-                    "message": "Ubuntu receiver is running",
-                    "output_file": str(output_file.resolve()),
-                },
-            )
+    for cmd in clipboard_commands:
+        if shutil.which(cmd[0]):
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                return result.stdout
 
-        def do_POST(self):
-            if self.path != "/send":
-                self._send_json(404, {"ok": False, "error": "Not found"})
-                return
+    raise RuntimeError("No supported clipboard command found.")
 
-            content_length = int(self.headers.get("Content-Length", "0"))
-            raw_body = self.rfile.read(content_length)
 
-            try:
-                payload = json.loads(raw_body.decode("utf-8"))
-            except json.JSONDecodeError:
-                self._send_json(400, {"ok": False, "error": "Body must be valid JSON"})
-                return
-
-            if token and payload.get("token") != token:
-                self._send_json(403, {"ok": False, "error": "Invalid token"})
-                return
-
-            text = (payload.get("text") or "").rstrip()
-            if not text:
-                self._send_json(400, {"ok": False, "error": "Field 'text' cannot be empty"})
-                return
-
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            block = f"[{now}]\n{text}\n\n{'-' * 40}\n"
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-            with output_file.open("a", encoding="utf-8") as f:
-                f.write(block)
-
-            # 直接打印到终端
-            print(f"\n{'='*40}")
-            print(f"[{now}] 收到消息：")
-            print(text)
-            print(f"{'='*40}\n")
-
-            self._send_json(
-                200,
-                {
-                    "ok": True,
-                    "saved_to": str(output_file.resolve()),
-                    "chars": len(text),
-                },
-            )
-
-        def log_message(self, format, *args):
-            return
-
-    return ReceiverHandler
+def read_text(args):
+    if args.clipboard:
+        return read_clipboard()
+    if args.text:
+        return " ".join(args.text)
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    raise RuntimeError("Provide text, stdin, or use --clipboard.")
 
 
 def main():
     args = parse_args()
-    output_file = Path(args.output)
-    handler_cls = build_handler(output_file, args.token)
-    server = HTTPServer((args.host, args.port), handler_cls)
+    text = read_text(args).strip()
+    if not text:
+        raise RuntimeError("Nothing to send.")
 
-    print(f"Receiver listening on http://{args.host}:{args.port}")
-    print(f"Messages will be saved to: {output_file.resolve()}")
-    if args.token:
-        print("Token check: enabled")
-    else:
-        print("Token check: disabled")
+    url = f"http://{args.host}:{args.port}/send"
+    payload = json.dumps(
+        {"text": text, "token": args.token, "sender": args.sender},
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    request = Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
 
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nReceiver stopped.")
-    finally:
-        server.server_close()
+        with urlopen(request, timeout=10) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        message = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Server returned HTTP {exc.code}: {message}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Could not connect to receiver: {exc}") from exc
+
+    print("Send complete")
+    print(f"Receiver: {body.get('device_name')}")
+    print(f"Saved to: {body.get('saved_to')}")
+    print(f"Characters: {body.get('chars')}")
 
 
 if __name__ == "__main__":
