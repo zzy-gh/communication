@@ -77,6 +77,12 @@ def build_handler(output_file: Path, token: str):
             with output_file.open("a", encoding="utf-8") as f:
                 f.write(block)
 
+            # 直接打印到终端
+            print(f"\n{'='*40}")
+            print(f"[{now}] 收到消息：")
+            print(text)
+            print(f"{'='*40}\n")
+
             self._send_json(
                 200,
                 {
